@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Authenticator TOTP</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f5f7fb;color:#172033;font-family:Arial,sans-serif;min-height:100vh;padding:18px}
+.app{max-width:520px;margin:auto}.card{background:#fff;border-radius:22px;padding:22px;margin-bottom:16px;box-shadow:0 8px 30px #0001}
+h1{text-align:center;margin:0 0 7px}.sub{text-align:center;color:#70798a;margin:0 0 20px;font-size:14px}
+label{display:block;font-weight:bold;margin:12px 0 7px}input{width:100%;padding:13px;border:1px solid #d6dce6;border-radius:11px;font-size:16px}
+button{width:100%;padding:13px;margin-top:10px;border:0;border-radius:11px;background:#315bea;color:#fff;font-weight:bold;font-size:15px;cursor:pointer}
+button.secondary{background:#edf1ff;color:#315bea}button.danger{background:#ffecec;color:#c62828}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:9px}.account{border:1px solid #e1e5ec;border-radius:16px;padding:16px;margin-top:12px}
+.name{font-weight:bold}.issuer{font-size:13px;color:#737d8d;margin-top:3px}
+.code{font-size:38px;font-weight:800;letter-spacing:7px;text-align:center;margin:14px 0 5px;font-variant-numeric:tabular-nums;direction:ltr}
+.timer{height:7px;background:#e8ebf1;border-radius:20px;overflow:hidden}.bar{height:100%;background:#315bea;width:100%;transition:width 1s linear}
+.small{text-align:center;color:#70798a;font-size:13px;margin-top:8px}.msg{display:none;padding:12px;border-radius:11px;margin-top:12px;font-size:14px}.err{background:#fff0f0;color:#b42318}.ok{background:#effaf2;color:#18733b}
+#reader{margin-top:12px;border-radius:12px;overflow:hidden}
+.hidden{display:none}.tools{margin-top:12px}
+</style>
+</head>
+<body>
+<div class="app">
+<div class="card">
+<h1>Authenticator</h1>
+<p class="sub">رموز تحقق TOTP من 6 أرقام</p>
+
+<label>اسم الحساب</label>
+<input id="name" placeholder="مثال: Google">
+
+<label>المفتاح السري Base32</label>
+<input id="secret" autocomplete="off" placeholder="مثال: JBSWY3DPEHPK3PXP">
+
+<div class="row">
+<button id="add">إضافة الحساب</button>
+<button id="scan" class="secondary">مسح QR</button>
+</div>
+
+<div id="reader" class="hidden"></div>
+<div id="message" class="msg"></div>
+
+<div class="tools">
+<div class="row">
+<button id="backup" class="secondary">تصدير نسخة احتياطية</button>
+<button id="restore" class="secondary">استيراد نسخة</button>
+</div>
+<input id="file" type="file" accept=".json,application/json" class="hidden">
+</div>
+</div>
+
+<div class="card">
+<h3>الحسابات</h3>
+<div id="accounts"></div>
+</div>
+</div>
+
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<script>
+const KEY="totp_accounts_v2";
+let accounts=load();
+let scanner=null;
+
+function load(){
+  try{
+    const x=JSON.parse(localStorage.getItem(KEY)||"[]");
+    return Array.isArray(x)?x:[];
+  }catch{return []}
+}
+function save(){localStorage.setItem(KEY,JSON.stringify(accounts))}
+function message(t,type="err"){
+ const el=document.getElementById("message");
+ el.textContent=t;el.className="msg "+type;el.style.display="block";
+}
+function clearMessage(){document.getElementById("message").style.display="none"}
+
+function base32ToBytes(input){
+ const alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+ const s=(input||"").toUpperCase().replace(/[\s=-]/g,"");
+ if(!s || !/^[A-Z2-7]+$/.test(s)) throw Error("المفتاح السري خطأ: يجب أن يكون Base32 صالحًا.");
+ let bits="";
+ for(const c of s) bits+=(alphabet.indexOf(c)).toString(2).padStart(5,"0");
+ const out=[];
+ for(let i=0;i+8<=bits.length;i+=8) out.push(parseInt(bits.slice(i,i+8),2));
+ if(out.length<10) throw Error("المفتاح السري قصير أو غير صالح.");
+ return new Uint8Array(out);
+}
+
+function parseOTPAuth(text){
+ try{
+  const u=new URL(text);
+  if(u.protocol!=="otpauth:" || u.host!=="totp") throw Error();
+  const secret=u.searchParams.get("secret");
+  if(!secret) throw Error();
+  const bytes=base32ToBytes(secret);
+  const algorithm=(u.searchParams.get("algorithm")||"SHA1").toUpperCase();
+  const digits=parseInt(u.searchParams.get("digits")||"6",10);
+  const period=parseInt(u.searchParams.get("period")||"30",10);
+  if(algorithm!=="SHA1" || digits!==6 || period!==30)
+    throw Error("QR صحيح لكن إعدادات TOTP غير مدعومة. يلزم SHA1 / 6 أرقام / 30 ثانية.");
+  return {
+    name:decodeURIComponent(u.pathname.slice(1))||u.searchParams.get("issuer")||"حساب",
+    secret:secret.toUpperCase().replace(/[\s=-]/g,""),
+    issuer:u.searchParams.get("issuer")||"",
+    bytes
+  };
+ }catch(e){throw Error(e.message||"باركود TOTP غير صالح.")}
+}
+
+async function totp(bytes){
+ const counter=Math.floor(Date.now()/1000/30);
+ const buf=new ArrayBuffer(8),v=new DataView(buf);
+ v.setUint32(0,Math.floor(counter/4294967296));v.setUint32(4,counter>>>0);
+ const key=await crypto.subtle.importKey("raw",bytes,{name:"HMAC",hash:"SHA-1"},false,["sign"]);
+ const h=new Uint8Array(await crypto.subtle.sign("HMAC",key,buf));
+ const o=h[19]&15;
+ const n=((h[o]&127)<<24)|((h[o+1]&255)<<16)|((h[o+2]&255)<<8)|(h[o+3]&255);
+ return String(n%1000000).padStart(6,"0");
+}
+
+async function render(){
+ const box=document.getElementById("accounts");
+ box.innerHTML="";
+ if(!accounts.length){box.innerHTML='<div class="small">لا توجد حسابات محفوظة.</div>';return}
+ for(let i=0;i<accounts.length;i++){
+  const a=accounts[i];
+  const el=document.createElement("div");el.className="account";
+  el.innerHTML=`<div class="name"></div><div class="issuer"></div>
+  <div class="code">------</div><div class="timer"><div class="bar"></div></div>
+  <div class="small">يتغير الرمز تلقائيًا</div>
+  <div class="row"><button class="secondary copy">نسخ</button><button class="danger delete">حذف</button></div>`;
+  el.querySelector(".name").textContent=a.name||"حساب";
+  el.querySelector(".issuer").textContent=a.issuer||"";
+  el.querySelector(".copy").onclick=async()=>{
+    const c=await totp(base32ToBytes(a.secret)); await navigator.clipboard.writeText(c);
+    message("تم نسخ الرمز.","ok");
+  };
+  el.querySelector(".delete").onclick=()=>{if(confirm("حذف هذا الحساب؟")){accounts.splice(i,1);save();render()}};
+  box.appendChild(el);
+  updateAccount(el,a);
+ }
+}
+async function updateAccount(el,a){
+ try{
+  el.querySelector(".code").textContent=await totp(base32ToBytes(a.secret));
+  const remain=30-(Math.floor(Date.now()/1000)%30);
+  el.querySelector(".bar").style.width=(remain/30*100)+"%";
+ }catch{}
+}
+setInterval(()=>document.querySelectorAll(".account").forEach((el,i)=>updateAccount(el,accounts[i])),1000);
+
+document.getElementById("add").onclick=()=>{
+ clearMessage();
+ try{
+  const secret=document.getElementById("secret").value.trim();
+  const bytes=base32ToBytes(secret);
+  const name=document.getElementById("name").value.trim()||"حساب";
+  if(accounts.some(a=>a.secret===secret.toUpperCase().replace(/[\s=-]/g,"")))
+    throw Error("هذا الحساب موجود مسبقًا.");
+  accounts.push({name,secret:secret.toUpperCase().replace(/[\s=-]/g,""),issuer:""});
+  save();render();
+  document.getElementById("secret").value="";document.getElementById("name").value="";
+  message("تمت إضافة الحساب وحفظه على الجهاز.","ok");
+ }catch(e){message(e.message||"المفتاح السري خطأ.")}
+};
+
+document.getElementById("scan").onclick=async()=>{
+ clearMessage();
+ const r=document.getElementById("reader");
+ r.classList.remove("hidden");
+ if(!window.Html5Qrcode){message("تعذر تحميل أداة الكاميرا. تحقق من اتصال الإنترنت.");return}
+ if(scanner)return;
+ scanner=new Html5Qrcode("reader");
+ try{
+  await scanner.start({facingMode:"environment"},{fps:10,qrbox:{width:240,height:240}},
+   async text=>{
+    try{
+     const a=parseOTPAuth(text);
+     await scanner.stop();scanner.clear();scanner=null;r.classList.add("hidden");
+     if(accounts.some(x=>x.secret===a.secret)){message("هذا الحساب موجود مسبقًا.");return}
+     accounts.push({name:a.name,secret:a.secret,issuer:a.issuer});
+     save();render();message("تمت قراءة QR بنجاح وحفظ الحساب.","ok");
+    }catch(e){message(e.message||"الباركود خطأ أو غير مدعوم.");}
+   });
+ }catch(e){scanner=null;r.classList.add("hidden");message("تعذر تشغيل الكاميرا. اسمح للموقع باستخدام الكاميرا.")}
+};
+
+document.getElementById("backup").onclick=()=>{
+ const blob=new Blob([JSON.stringify(accounts,null,2)],{type:"application/json"});
+ const a=document.createElement("a");a.href=URL.createObjectURL(blob);
+ a.download="totp-backup.json";a.click();URL.revokeObjectURL(a.href);
+ message("تم إنشاء نسخة احتياطية. احتفظ بها بمكان آمن.","ok");
+};
+
+document.getElementById("restore").onclick=()=>document.getElementById("file").click();
+document.getElementById("file").onchange=async e=>{
+ clearMessage();const f=e.target.files[0];if(!f)return;
+ try{
+  const data=JSON.parse(await f.text());
+  if(!Array.isArray(data))throw Error();
+  const clean=[];
+  for(const a of data){
+   const secret=String(a.secret||"").toUpperCase().replace(/[\s=-]/g,"");
+   base32ToBytes(secret);
+   if(!clean.some(x=>x.secret===secret)) clean.push({name:String(a.name||"حساب"),secret,issuer:String(a.issuer||"")});
+  }
+  accounts=clean;save();render();message("تم استرجاع الحسابات بنجاح.","ok");
+ }catch{message("ملف النسخة الاحتياطية خطأ أو يحتوي على بيانات غير صالحة.")}
+ e.target.value="";
+};
+render();
+</script>
+</body>
+</html>
